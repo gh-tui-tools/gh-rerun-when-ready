@@ -1,0 +1,7 @@
+# Built extension binary
+/gh-rerun-when-ready
+/gh-rerun-when-ready.exe
+
+# Editor backup/undo files
+*~
+*.un~
