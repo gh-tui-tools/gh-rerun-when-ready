@@ -209,8 +209,45 @@ func TestWatchStopsRetryingWhenGitHubRefuses(t *testing.T) {
 	if len(f.reruns) != 1 {
 		t.Fatalf("re-runs = %v, want exactly one attempt\n%s", f.reruns, out.String())
 	}
-	if !strings.Contains(out.String(), "could not re-run") {
-		t.Errorf("expected the refusal to be reported:\n%s", out.String())
+	log := out.String()
+	if !strings.Contains(log, "could not re-run") {
+		t.Errorf("expected the refusal to be reported:\n%s", log)
+	}
+	if !strings.Contains(log, "GitHub would not re-run") {
+		t.Errorf("expected the summary to name the refusal:\n%s", log)
+	}
+	// A refusal isn't a spent retry budget — and must not read as one.
+	if strings.Contains(log, "still failing after") {
+		t.Errorf("a refusal reported as a spent budget:\n%s", log)
+	}
+}
+
+func TestWatchReportsASpentAttemptBudgetSeparately(t *testing.T) {
+	// The other way a run ends up unfixed: It really was re-run, and really
+	// failed again. That must not read like a refusal.
+	failed := rerun.Run{DatabaseID: 7, WorkflowName: "CI",
+		Status: "completed", Conclusion: "failure"}
+	f := &fakeClient{sha: "abc", polls: [][]rerun.Run{{failed}}}
+
+	var out bytes.Buffer
+	code := watch(f, fast(options{repo: "o/r", number: 1}), &out, nil)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1\n%s", code, out.String())
+	}
+	if len(f.reruns) != 1 {
+		t.Fatalf("re-runs = %v, want exactly one\n%s", f.reruns, out.String())
+	}
+	log := out.String()
+	if !strings.Contains(log, "still failing after 1 attempt(s)") {
+		t.Errorf("expected the spent budget to be reported:\n%s", log)
+	}
+	if !strings.Contains(log, "raise --attempts") {
+		t.Errorf("expected it to say how to retry more:\n%s", log)
+	}
+	// The re-run did happen — so this must not read as a refusal.
+	if strings.Contains(log, "GitHub would not re-run") {
+		t.Errorf("a spent budget reported as a refusal:\n%s", log)
 	}
 }
 

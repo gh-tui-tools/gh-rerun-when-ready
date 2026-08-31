@@ -183,7 +183,11 @@ func watch(c client, o options, out io.Writer, interrupt <-chan os.Signal) int {
 	if o.timeout > 0 {
 		deadline = time.Now().Add(o.timeout)
 	}
+	// 'attempts' counts the re-runs actually performed, per run. 'refused' holds
+	// the runs GitHub declined to re-run, and why. A run is left alone once it's
+	// in either — but only 'attempts' reflects work that really happened.
 	attempts := map[int64]int{}
+	refused := map[int64]string{}
 
 	for {
 		latest, _, _, err := c.pullRequest(o.repo, o.number)
@@ -193,7 +197,8 @@ func watch(c client, o options, out io.Writer, interrupt <-chan os.Signal) int {
 		}
 		if latest != sha {
 			logf(out, "head moved to %.10s, watching that instead", latest)
-			sha, attempts = latest, map[int64]int{}
+			sha = latest
+			attempts, refused = map[int64]int{}, map[int64]string{}
 		}
 
 		runs, err := c.runsForCommit(o.repo, sha)
@@ -201,7 +206,14 @@ func watch(c client, o options, out io.Writer, interrupt <-chan os.Signal) int {
 			fmt.Fprintf(os.Stderr, "Error listing workflow runs: %v\n", err)
 			return 1
 		}
-		b := rerun.Classify(runs, attempts, o.attempts)
+		budget := make(map[int64]int, len(attempts)+len(refused))
+		for id, n := range attempts {
+			budget[id] = n
+		}
+		for id := range refused {
+			budget[id] = o.attempts
+		}
+		b := rerun.Classify(runs, budget, o.attempts)
 
 		// GitHub's refusal is scoped to a single run: it declines to re-run
 		// the failed jobs of a run whose own jobs are still going. But a run
@@ -213,7 +225,6 @@ func watch(c client, o options, out io.Writer, interrupt <-chan os.Signal) int {
 			if o.dryRun {
 				logf(out, "would re-run failed jobs of %s [%s]",
 					rerun.Describe(r), r.Conclusion)
-				attempts[r.DatabaseID] = o.attempts
 				continue
 			}
 			logf(out, "re-running failed jobs of %s [%s] (attempt %d)",
@@ -221,7 +232,7 @@ func watch(c client, o options, out io.Writer, interrupt <-chan os.Signal) int {
 			if err := c.rerunFailedJobs(o.repo, r.DatabaseID); err != nil {
 				logf(out, "  could not re-run: %v", err)
 				// Do not spin on a run GitHub will not re-run.
-				attempts[r.DatabaseID] = o.attempts
+				refused[r.DatabaseID] = err.Error()
 				continue
 			}
 			attempts[r.DatabaseID] = attempt
@@ -245,12 +256,29 @@ func watch(c client, o options, out io.Writer, interrupt <-chan os.Signal) int {
 				logf(out, "needs attention: %s [%s] %s",
 					rerun.Describe(r), r.Conclusion, r.URL)
 			}
-			if len(b.Exhausted) > 0 {
-				logf(out, "done: %d run(s) still failing after %d attempt(s)",
-					len(b.Exhausted), o.attempts)
-				for _, r := range b.Exhausted {
+			var declined, spent []rerun.Run
+			for _, r := range b.Exhausted {
+				if _, no := refused[r.DatabaseID]; no {
+					declined = append(declined, r)
+				} else {
+					spent = append(spent, r)
+				}
+			}
+			if len(declined) > 0 {
+				logf(out, "done: %d run(s) GitHub would not re-run", len(declined))
+				for _, r := range declined {
+					logf(out, "  %s: %s", rerun.Describe(r), refused[r.DatabaseID])
+					logf(out, "  %s", r.URL)
+				}
+			}
+			if len(spent) > 0 {
+				logf(out, "done: %d run(s) still failing after %d attempt(s);"+
+					" raise --attempts to retry more", len(spent), o.attempts)
+				for _, r := range spent {
 					logf(out, "  %s %s", rerun.Describe(r), r.URL)
 				}
+			}
+			if len(declined) > 0 || len(spent) > 0 {
 				return 1
 			}
 			logf(out, "done: every run for this commit succeeded")
