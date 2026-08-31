@@ -62,7 +62,8 @@ func NeedsAttention(r Run) bool {
 
 // Buckets sorts a pull request's runs by what should happen to each.
 type Buckets struct {
-	// Pending runs are still going, so nothing can be re-run yet.
+	// Pending runs are still going, so their own failed jobs can't be
+	// re-run yet. They do not hold back any other run.
 	Pending []Run
 	// Rerun are finished, failed, and have attempts left.
 	Rerun []Run

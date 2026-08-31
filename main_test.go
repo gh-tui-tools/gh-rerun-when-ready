@@ -65,11 +65,13 @@ func TestParseArgs(t *testing.T) {
 
 // fakeClient serves a scripted sequence of run lists and records re-runs.
 type fakeClient struct {
-	sha      string
-	polls    [][]rerun.Run
-	call     int
-	reruns   []int64
-	failNext bool
+	sha    string
+	polls  [][]rerun.Run
+	call   int
+	reruns []int64
+	// rerunPoll[i] is the poll number reruns[i] was requested during.
+	rerunPoll []int
+	failNext  bool
 }
 
 func (f *fakeClient) pullRequest(string, int) (string, string, string, error) {
@@ -87,6 +89,7 @@ func (f *fakeClient) runsForCommit(string, string) ([]rerun.Run, error) {
 
 func (f *fakeClient) rerunFailedJobs(_ string, id int64) error {
 	f.reruns = append(f.reruns, id)
+	f.rerunPoll = append(f.rerunPoll, f.call)
 	if f.failNext {
 		f.failNext = false
 		return os.ErrPermission
@@ -102,21 +105,25 @@ func fast(o options) options {
 	return o
 }
 
-func TestWatchWaitsForPendingRunsBeforeRerunning(t *testing.T) {
-	failed := rerun.Run{DatabaseID: 7, WorkflowName: "CI",
+func TestWatchRerunsAFinishedRunWhileAnotherIsStillPending(t *testing.T) {
+	// GitHub scopes its refusal to a single run. So, a CI run that's
+	// finished and failed can be re-run even though the unrelated Flatpak
+	// run of the same commit is still going.
+	failedCI := rerun.Run{DatabaseID: 7, WorkflowName: "CI",
 		Status: "completed", Conclusion: "failure"}
-	pending := rerun.Run{DatabaseID: 8, WorkflowName: "Lint",
+	rerunningCI := rerun.Run{DatabaseID: 7, WorkflowName: "CI",
 		Status: "in_progress"}
-	done := rerun.Run{DatabaseID: 8, WorkflowName: "Lint",
+	greenCI := rerun.Run{DatabaseID: 7, WorkflowName: "CI",
 		Status: "completed", Conclusion: "success"}
-	reran := rerun.Run{DatabaseID: 7, WorkflowName: "CI",
+	pendingFlatpak := rerun.Run{DatabaseID: 8, WorkflowName: "Flatpak",
+		Status: "in_progress"}
+	greenFlatpak := rerun.Run{DatabaseID: 8, WorkflowName: "Flatpak",
 		Status: "completed", Conclusion: "success"}
 
-	f := &fakeClient{sha: "abc1234567", polls: [][]rerun.Run{
-		{failed, pending}, // Lint still going: must not re-run yet
-		{failed, pending}, // still going
-		{failed, done},    // now everything has finished: re-run CI
-		{reran, done},     // the re-run succeeded
+	f := &fakeClient{sha: "548b670015", polls: [][]rerun.Run{
+		{failedCI, pendingFlatpak},    // CI has finished, Flatpak has not
+		{rerunningCI, pendingFlatpak}, // the re-run is under way
+		{greenCI, greenFlatpak},
 	}}
 
 	var out bytes.Buffer
@@ -128,12 +135,46 @@ func TestWatchWaitsForPendingRunsBeforeRerunning(t *testing.T) {
 	if len(f.reruns) != 1 || f.reruns[0] != 7 {
 		t.Fatalf("re-runs = %v, want exactly [7]\n%s", f.reruns, out.String())
 	}
-	log := out.String()
-	if !strings.Contains(log, "waiting on 1 run(s)") {
-		t.Errorf("expected it to report waiting:\n%s", log)
+	if f.rerunPoll[0] != 1 {
+		t.Errorf("re-ran during poll %d, want poll 1: Flatpak being unfinished"+
+			" must not hold CI back\n%s", f.rerunPoll[0], out.String())
 	}
-	if !strings.Contains(log, "every run for this commit succeeded") {
-		t.Errorf("expected a success line:\n%s", log)
+	if !strings.Contains(out.String(), "waiting on 1 run(s): Flatpak") {
+		t.Errorf("expected it to go on waiting for Flatpak:\n%s", out.String())
+	}
+}
+
+func TestWatchWaitsForARunToFinishBeforeRerunningIt(t *testing.T) {
+	// The refusal that does bite: A run whose own jobs are still going
+	// can't have its failed jobs re-run yet.
+	running := rerun.Run{DatabaseID: 7, WorkflowName: "CI",
+		Status: "in_progress"}
+	failed := rerun.Run{DatabaseID: 7, WorkflowName: "CI",
+		Status: "completed", Conclusion: "failure"}
+	green := rerun.Run{DatabaseID: 7, WorkflowName: "CI",
+		Status: "completed", Conclusion: "success"}
+
+	f := &fakeClient{sha: "abc1234567", polls: [][]rerun.Run{
+		{running}, // still going, so there's nothing to do yet
+		{failed},  // finished and failed, so re-run it now
+		{green},
+	}}
+
+	var out bytes.Buffer
+	code := watch(f, fast(options{repo: "o/r", number: 1}), &out, nil)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0\n%s", code, out.String())
+	}
+	if len(f.reruns) != 1 || f.reruns[0] != 7 {
+		t.Fatalf("re-runs = %v, want exactly [7]\n%s", f.reruns, out.String())
+	}
+	if f.rerunPoll[0] != 2 {
+		t.Errorf("re-ran during poll %d, want poll 2: it was still going at"+
+			" poll 1\n%s", f.rerunPoll[0], out.String())
+	}
+	if !strings.Contains(out.String(), "every run for this commit succeeded") {
+		t.Errorf("expected a success line:\n%s", out.String())
 	}
 }
 

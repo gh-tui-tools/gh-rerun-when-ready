@@ -30,9 +30,11 @@ const helpText = `Usage: gh rerun-when-ready [options] <pull-request>
 Re-run a pull request's failed CI jobs, as soon as GitHub will allow it.
 
 GitHub refuses to re-run the failed jobs of a workflow run while any of that
-run's other jobs are still going. This waits until every run for the pull
-request's head commit has finished, then re-runs the failed jobs of the runs
-that failed, timed out, or were cancelled.
+run's other jobs are still going. That refusal applies to one run at a time.
+So, each workflow run of the head commit is watched separately: Its failed
+jobs are re-run as soon as that run itself finishes, whether or not the
+commit's other runs have. Runs that failed, timed out, or were cancelled are
+the ones re-run.
 
 Arguments:
   <pull-request>          Pull request number or URL
@@ -201,38 +203,43 @@ func watch(c client, o options, out io.Writer, interrupt <-chan os.Signal) int {
 		}
 		b := rerun.Classify(runs, attempts, o.attempts)
 
+		// GitHub's refusal is scoped to a single run: it declines to re-run
+		// the failed jobs of a run whose own jobs are still going. But a run
+		// that's finished can be re-run while other runs of the same commit
+		// are still going. So, each run is acted on as soon as it finishes,
+		// rather than after the slowest run of the commit finishes.
+		for _, r := range b.Rerun {
+			attempt := attempts[r.DatabaseID] + 1
+			if o.dryRun {
+				logf(out, "would re-run failed jobs of %s [%s]",
+					rerun.Describe(r), r.Conclusion)
+				attempts[r.DatabaseID] = o.attempts
+				continue
+			}
+			logf(out, "re-running failed jobs of %s [%s] (attempt %d)",
+				rerun.Describe(r), r.Conclusion, attempt)
+			if err := c.rerunFailedJobs(o.repo, r.DatabaseID); err != nil {
+				logf(out, "  could not re-run: %v", err)
+				// Do not spin on a run GitHub will not re-run.
+				attempts[r.DatabaseID] = o.attempts
+				continue
+			}
+			attempts[r.DatabaseID] = attempt
+		}
+
 		switch {
 		case len(runs) == 0:
 			logf(out, "no workflow runs for this commit yet")
 		case len(b.Pending) > 0:
 			logf(out, "waiting on %d run(s): %s", len(b.Pending), summarize(b.Pending))
 		case len(b.Rerun) > 0:
-			for _, r := range b.Rerun {
-				attempt := attempts[r.DatabaseID] + 1
-				if o.dryRun {
-					logf(out, "would re-run failed jobs of %s [%s]",
-						rerun.Describe(r), r.Conclusion)
-					attempts[r.DatabaseID] = o.attempts
-					continue
+			if !o.dryRun {
+				// Give GitHub a moment to move the re-runs out of "completed".
+				if !sleep(min(o.interval, 10*time.Second), interrupt) {
+					return 130
 				}
-				logf(out, "re-running failed jobs of %s [%s] (attempt %d)",
-					rerun.Describe(r), r.Conclusion, attempt)
-				if err := c.rerunFailedJobs(o.repo, r.DatabaseID); err != nil {
-					logf(out, "  could not re-run: %v", err)
-					// Do not spin on a run GitHub will not re-run.
-					attempts[r.DatabaseID] = o.attempts
-					continue
-				}
-				attempts[r.DatabaseID] = attempt
+				continue
 			}
-			if o.dryRun {
-				return 0
-			}
-			// Give GitHub a moment to move the re-run out of "completed".
-			if !sleep(min(o.interval, 10*time.Second), interrupt) {
-				return 130
-			}
-			continue
 		default:
 			for _, r := range b.Attention {
 				logf(out, "needs attention: %s [%s] %s",
@@ -250,6 +257,9 @@ func watch(c client, o options, out io.Writer, interrupt <-chan os.Signal) int {
 			return 0
 		}
 
+		if o.dryRun {
+			return 0
+		}
 		if !deadline.IsZero() && time.Now().After(deadline) {
 			logf(out, "giving up after %s", o.timeout)
 			return 1

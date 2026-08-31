@@ -55,7 +55,7 @@ func run(id int64, status, conclusion string) Run {
 }
 
 func TestClassify(t *testing.T) {
-	t.Run("a run still going blocks everything", func(t *testing.T) {
+	t.Run("a pending run does not hold back a finished one", func(t *testing.T) {
 		runs := []Run{
 			run(1, "completed", "failure"),
 			run(2, "in_progress", ""),
@@ -65,8 +65,8 @@ func TestClassify(t *testing.T) {
 		if len(b.Pending) != 2 {
 			t.Fatalf("want 2 pending, got %d", len(b.Pending))
 		}
-		// The failed run is still reported, so that the caller can wait
-		// rather than act on it.
+		// The finished, failed run is bucketed apart from the pending
+		// ones — so the caller can act on it while they go on.
 		if len(b.Rerun) != 1 {
 			t.Fatalf("want 1 rerunnable, got %d", len(b.Rerun))
 		}
