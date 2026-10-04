@@ -1,8 +1,10 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -23,6 +25,9 @@ type options struct {
 	interval time.Duration
 	attempts int
 	timeout  time.Duration
+	// retryFor is how long requests may keep failing transiently before the
+	// watch gives up.
+	retryFor time.Duration
 }
 
 const helpText = `Usage: gh rerun-when-ready [options] <pull-request>
@@ -54,7 +59,7 @@ Options:
 // request. Unknown flags are an error, so that a typo does not silently
 // become the pull request argument.
 func parseArgs(argv []string) (options, error) {
-	o := options{interval: 60 * time.Second, attempts: 1}
+	o := options{interval: 60 * time.Second, attempts: 1, retryFor: 5 * time.Minute}
 	needsValue := func(i int, flag string) (string, error) {
 		if i+1 >= len(argv) {
 			return "", fmt.Errorf("%s requires a value", flag)
@@ -165,10 +170,92 @@ func (c restClient) rerunFailedJobs(repo string, runID int64) error {
 	return c.api.Post(path, nil, nil)
 }
 
+// transient reports whether a failed request is worth retrying: It never got
+// an answer (a timeout or a dropped connection, e.g.), or GitHub failed on its
+// own side, or limited the rate. An answer that declines the request isn't
+// transient — retrying it would only get the same answer.
+func transient(err error) bool {
+	var httpErr *api.HTTPError
+	if !errors.As(err, &httpErr) {
+		return true
+	}
+	switch {
+	case httpErr.StatusCode >= 500, httpErr.StatusCode == http.StatusTooManyRequests:
+		return true
+	case httpErr.StatusCode == http.StatusForbidden:
+		// GitHub's primary and secondary rate limits answer 403 too.
+		return httpErr.Headers.Get("Retry-After") != "" ||
+			httpErr.Headers.Get("X-RateLimit-Remaining") == "0"
+	}
+	return false
+}
+
+// The first wait before retrying a failed read. Each further wait doubles,
+// up to the polling interval.
+const firstRetryWait = 5 * time.Second
+
+// errInterrupted reports that an interrupt ended a wait between retries.
+var errInterrupted = errors.New("interrupted")
+
+// retryingReads retries the reads of a client that fail transiently, so that
+// one dropped request doesn't end a watch that otherwise runs for hours. It
+// gives up, and returns the last error, once a read has kept failing for
+// o.retryFor.
+type retryingReads struct {
+	client
+	o         options
+	out       io.Writer
+	interrupt <-chan os.Signal
+}
+
+func (c retryingReads) pullRequest(repo string, number int) (sha, state, title string, err error) {
+	err = c.retry("reading pull request", func() (err error) {
+		sha, state, title, err = c.client.pullRequest(repo, number)
+		return err
+	})
+	return sha, state, title, err
+}
+
+func (c retryingReads) runsForCommit(repo, sha string) (runs []rerun.Run, err error) {
+	err = c.retry("listing workflow runs", func() (err error) {
+		runs, err = c.client.runsForCommit(repo, sha)
+		return err
+	})
+	return runs, err
+}
+
+func (c retryingReads) retry(what string, read func() error) error {
+	since := time.Time{}
+	wait := min(firstRetryWait, c.o.interval)
+	for {
+		err := read()
+		if err == nil || !transient(err) {
+			return err
+		}
+		if since.IsZero() {
+			since = time.Now()
+		}
+		if time.Since(since) >= c.o.retryFor {
+			logf(c.out, "giving up: %s kept failing for %s", what,
+				time.Since(since).Round(time.Second))
+			return err
+		}
+		logf(c.out, "error %s, trying again in %s: %v", what, wait, err)
+		if !sleep(wait, c.interrupt) {
+			return errInterrupted
+		}
+		wait = min(2*wait, c.o.interval)
+	}
+}
+
 // watch polls the pull request until nothing is still going, re-running the
 // failed jobs of the runs that need it, and returns the process exit code.
 func watch(c client, o options, out io.Writer, interrupt <-chan os.Signal) int {
+	c = retryingReads{client: c, o: o, out: out, interrupt: interrupt}
 	sha, state, title, err := c.pullRequest(o.repo, o.number)
+	if errors.Is(err, errInterrupted) {
+		return 130
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error reading pull request: %v\n", err)
 		return 1
@@ -186,11 +273,17 @@ func watch(c client, o options, out io.Writer, interrupt <-chan os.Signal) int {
 	// 'attempts' counts the re-runs actually performed, per run. 'refused' holds
 	// the runs GitHub declined to re-run, and why. A run is left alone once it's
 	// in either — but only 'attempts' reflects work that really happened.
+	// 'unsent' holds the runs whose re-run request failed transiently, and when
+	// that first happened; they're asked again on the next poll.
 	attempts := map[int64]int{}
 	refused := map[int64]string{}
+	unsent := map[int64]time.Time{}
 
 	for {
 		latest, _, _, err := c.pullRequest(o.repo, o.number)
+		if errors.Is(err, errInterrupted) {
+			return 130
+		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error reading pull request: %v\n", err)
 			return 1
@@ -199,12 +292,24 @@ func watch(c client, o options, out io.Writer, interrupt <-chan os.Signal) int {
 			logf(out, "head moved to %.10s, watching that instead", latest)
 			sha = latest
 			attempts, refused = map[int64]int{}, map[int64]string{}
+			unsent = map[int64]time.Time{}
 		}
 
 		runs, err := c.runsForCommit(o.repo, sha)
+		if errors.Is(err, errInterrupted) {
+			return 130
+		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error listing workflow runs: %v\n", err)
 			return 1
+		}
+		for _, r := range runs {
+			if _, ok := unsent[r.DatabaseID]; ok && rerun.IsPending(r) {
+				// The request failed on our side, but GitHub got it: The run
+				// is going again, so that re-run counts.
+				attempts[r.DatabaseID]++
+				delete(unsent, r.DatabaseID)
+			}
 		}
 		budget := make(map[int64]int, len(attempts)+len(refused))
 		for id, n := range attempts {
@@ -230,11 +335,24 @@ func watch(c client, o options, out io.Writer, interrupt <-chan os.Signal) int {
 			logf(out, "re-running failed jobs of %s [%s] (attempt %d)",
 				rerun.Describe(r), r.Conclusion, attempt)
 			if err := c.rerunFailedJobs(o.repo, r.DatabaseID); err != nil {
-				logf(out, "  could not re-run: %v", err)
-				// Do not spin on a run GitHub will not re-run.
-				refused[r.DatabaseID] = err.Error()
+				if !transient(err) {
+					logf(out, "  could not re-run: %v", err)
+					// Do not spin on a run GitHub will not re-run.
+					refused[r.DatabaseID] = err.Error()
+					continue
+				}
+				if _, ok := unsent[r.DatabaseID]; !ok {
+					unsent[r.DatabaseID] = time.Now()
+				}
+				if time.Since(unsent[r.DatabaseID]) >= o.retryFor {
+					fmt.Fprintf(os.Stderr, "Error re-running failed jobs of %s: %v\n",
+						rerun.Describe(r), err)
+					return 1
+				}
+				logf(out, "  could not re-run, trying again: %v", err)
 				continue
 			}
+			delete(unsent, r.DatabaseID)
 			attempts[r.DatabaseID] = attempt
 		}
 

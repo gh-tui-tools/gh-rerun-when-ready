@@ -37,6 +37,8 @@ It polls the PR and watches each workflow run separately, re-running the failed 
 
 If new commits are pushed while it’s waiting, it notices the head has moved — and starts watching the new commit instead. A run that GitHub declines to re-run is reported rather than retried — so it can’t spin.
 
+A request that gets no answer (a timeout or a dropped connection), or that GitHub fails on its own side, doesn’t end the watch: It’s retried, with a growing wait between tries — and the watch gives up only once that request has kept failing for five minutes.
+
 Exit status is 0 when every run for the head commit has succeeded, and 1 when runs are still failing after the allotted attempts — or when GitHub declined to re-run one. Those two endings are reported separately — so a spent attempt budget never reads as a refusal.
 
 ## Develop

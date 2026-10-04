@@ -2,11 +2,12 @@ package main
 
 import (
 	"bytes"
-	"os"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/cli/go-gh/v2/pkg/api"
 	"github.com/gh-tui-tools/gh-rerun-when-ready/internal/rerun"
 )
 
@@ -14,7 +15,7 @@ func TestParseArgs(t *testing.T) {
 	t.Run("defaults", func(t *testing.T) {
 		o, err := parseArgs([]string{"123"})
 		if err != nil || o.target != "123" || o.interval != 60*time.Second ||
-			o.attempts != 1 || o.dryRun || o.timeout != 0 {
+			o.attempts != 1 || o.dryRun || o.timeout != 0 || o.retryFor != 5*time.Minute {
 			t.Fatalf("unexpected: %+v err=%v", o, err)
 		}
 	})
@@ -71,10 +72,20 @@ type fakeClient struct {
 	reruns []int64
 	// rerunPoll[i] is the poll number reruns[i] was requested during.
 	rerunPoll []int
-	failNext  bool
+	// prErr and rerunErr, when set, give the error for the nth call
+	// (counting from 1) of pullRequest and rerunFailedJobs.
+	prErr    func(n int) error
+	rerunErr func(n int) error
+	prCalls  int
 }
 
 func (f *fakeClient) pullRequest(string, int) (string, string, string, error) {
+	f.prCalls++
+	if f.prErr != nil {
+		if err := f.prErr(f.prCalls); err != nil {
+			return "", "", "", err
+		}
+	}
 	return f.sha, "open", "A title", nil
 }
 
@@ -90,17 +101,26 @@ func (f *fakeClient) runsForCommit(string, string) ([]rerun.Run, error) {
 func (f *fakeClient) rerunFailedJobs(_ string, id int64) error {
 	f.reruns = append(f.reruns, id)
 	f.rerunPoll = append(f.rerunPoll, f.call)
-	if f.failNext {
-		f.failNext = false
-		return os.ErrPermission
+	if f.rerunErr != nil {
+		return f.rerunErr(len(f.reruns))
 	}
 	return nil
 }
+
+// A request that never got an answer.
+var errTimeout = errors.New("read tcp: read: operation timed out")
+
+// GitHub's answer when it declines to re-run a run.
+var errDeclined = &api.HTTPError{StatusCode: 403,
+	Message: "This workflow is already running"}
 
 func fast(o options) options {
 	o.interval = time.Millisecond
 	if o.attempts == 0 {
 		o.attempts = 1
+	}
+	if o.retryFor == 0 {
+		o.retryFor = 50 * time.Millisecond
 	}
 	return o
 }
@@ -197,7 +217,13 @@ func TestWatchDryRunRerunsNothing(t *testing.T) {
 func TestWatchStopsRetryingWhenGitHubRefuses(t *testing.T) {
 	failed := rerun.Run{DatabaseID: 7, WorkflowName: "CI",
 		Status: "completed", Conclusion: "failure"}
-	f := &fakeClient{sha: "abc", polls: [][]rerun.Run{{failed}}, failNext: true}
+	f := &fakeClient{sha: "abc", polls: [][]rerun.Run{{failed}},
+		rerunErr: func(n int) error {
+			if n == 1 {
+				return errDeclined
+			}
+			return nil
+		}}
 
 	var out bytes.Buffer
 	code := watch(f, fast(options{repo: "o/r", number: 1, attempts: 3}), &out, nil)
@@ -281,4 +307,157 @@ func (m *movingClient) pullRequest(repo string, n int) (string, string, string, 
 		return m.fakeClient.pullRequest(repo, n)
 	}
 	return m.second, "open", "A title", nil
+}
+
+func TestTransient(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want bool
+	}{
+		{errTimeout, true},
+		{&api.HTTPError{StatusCode: 502}, true},
+		{&api.HTTPError{StatusCode: 429}, true},
+		{&api.HTTPError{StatusCode: 403, Headers: map[string][]string{
+			"X-Ratelimit-Remaining": {"0"}}}, true},
+		{&api.HTTPError{StatusCode: 403, Headers: map[string][]string{
+			"Retry-After": {"60"}}}, true},
+		{errDeclined, false},
+		{&api.HTTPError{StatusCode: 404}, false},
+		{&api.HTTPError{StatusCode: 422}, false},
+	} {
+		if got := transient(tc.err); got != tc.want {
+			t.Errorf("transient(%v) = %v, want %v", tc.err, got, tc.want)
+		}
+	}
+}
+
+func TestWatchRetriesAReadThatTimesOut(t *testing.T) {
+	// One dropped request mustn't end a watch that otherwise runs for hours.
+	pending := rerun.Run{DatabaseID: 7, WorkflowName: "CI", Status: "in_progress"}
+	green := rerun.Run{DatabaseID: 7, WorkflowName: "CI",
+		Status: "completed", Conclusion: "success"}
+	f := &fakeClient{sha: "abc", polls: [][]rerun.Run{{pending}, {green}},
+		prErr: func(n int) error {
+			if n == 3 || n == 4 { // two failures in a row, mid-watch
+				return errTimeout
+			}
+			return nil
+		}}
+
+	var out bytes.Buffer
+	code := watch(f, fast(options{repo: "o/r", number: 1, retryFor: time.Minute}), &out, nil)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0\n%s", code, out.String())
+	}
+	if got := strings.Count(out.String(), "error reading pull request, trying again"); got != 2 {
+		t.Errorf("reported %d retries, want 2:\n%s", got, out.String())
+	}
+}
+
+func TestWatchGivesUpOnReadsThatKeepFailing(t *testing.T) {
+	f := &fakeClient{sha: "abc", polls: [][]rerun.Run{{}},
+		prErr: func(n int) error {
+			if n > 1 {
+				return errTimeout
+			}
+			return nil
+		}}
+
+	var out bytes.Buffer
+	code := watch(f, fast(options{repo: "o/r", number: 1}), &out, nil)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1\n%s", code, out.String())
+	}
+	if !strings.Contains(out.String(), "giving up: reading pull request kept failing") {
+		t.Errorf("expected it to say it gave up:\n%s", out.String())
+	}
+}
+
+func TestWatchDoesNotRetryAnAnsweredRead(t *testing.T) {
+	// A 404 is GitHub's answer, and asking again would get the same one.
+	f := &fakeClient{sha: "abc", polls: [][]rerun.Run{{}},
+		prErr: func(int) error { return &api.HTTPError{StatusCode: 404} }}
+
+	var out bytes.Buffer
+	code := watch(f, fast(options{repo: "o/r", number: 1, retryFor: time.Minute}), &out, nil)
+
+	if code != 1 || f.prCalls != 1 {
+		t.Fatalf("code=%d calls=%d, want 1 and 1\n%s", code, f.prCalls, out.String())
+	}
+}
+
+func TestWatchRetriesAReRunThatTimesOut(t *testing.T) {
+	// A timeout isn't GitHub declining the re-run — so the run is asked
+	// again, rather than written off as refused.
+	failed := rerun.Run{DatabaseID: 7, WorkflowName: "CI",
+		Status: "completed", Conclusion: "failure"}
+	rerunning := rerun.Run{DatabaseID: 7, WorkflowName: "CI", Status: "in_progress"}
+	green := rerun.Run{DatabaseID: 7, WorkflowName: "CI",
+		Status: "completed", Conclusion: "success"}
+	f := &fakeClient{sha: "abc", polls: [][]rerun.Run{{failed}, {failed}, {rerunning}, {green}},
+		rerunErr: func(n int) error {
+			if n == 1 {
+				return errTimeout
+			}
+			return nil
+		}}
+
+	var out bytes.Buffer
+	code := watch(f, fast(options{repo: "o/r", number: 1, retryFor: time.Minute}), &out, nil)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0\n%s", code, out.String())
+	}
+	if len(f.reruns) != 2 {
+		t.Fatalf("re-runs = %v, want two requests\n%s", f.reruns, out.String())
+	}
+	if !strings.Contains(out.String(), "could not re-run, trying again") {
+		t.Errorf("expected the retry to be reported:\n%s", out.String())
+	}
+}
+
+func TestWatchCountsAReRunThatGitHubGotDespiteATimeout(t *testing.T) {
+	// The request timed out, but the run went again anyway — so that re-run
+	// spends an attempt, and the run failing again is a spent budget.
+	failed := rerun.Run{DatabaseID: 7, WorkflowName: "CI",
+		Status: "completed", Conclusion: "failure"}
+	rerunning := rerun.Run{DatabaseID: 7, WorkflowName: "CI", Status: "in_progress"}
+	f := &fakeClient{sha: "abc", polls: [][]rerun.Run{{failed}, {rerunning}, {failed}},
+		rerunErr: func(int) error { return errTimeout }}
+
+	var out bytes.Buffer
+	code := watch(f, fast(options{repo: "o/r", number: 1, retryFor: time.Minute}), &out, nil)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1\n%s", code, out.String())
+	}
+	if len(f.reruns) != 1 {
+		t.Fatalf("re-runs = %v, want exactly one\n%s", f.reruns, out.String())
+	}
+	log := out.String()
+	if !strings.Contains(log, "still failing after 1 attempt(s)") {
+		t.Errorf("expected the spent budget to be reported:\n%s", log)
+	}
+	if strings.Contains(log, "GitHub would not re-run") {
+		t.Errorf("a timeout reported as a refusal:\n%s", log)
+	}
+}
+
+func TestWatchGivesUpOnAReRunThatKeepsTimingOut(t *testing.T) {
+	failed := rerun.Run{DatabaseID: 7, WorkflowName: "CI",
+		Status: "completed", Conclusion: "failure"}
+	f := &fakeClient{sha: "abc", polls: [][]rerun.Run{{failed}},
+		rerunErr: func(int) error { return errTimeout }}
+
+	var out bytes.Buffer
+	code := watch(f, fast(options{repo: "o/r", number: 1}), &out, nil)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1\n%s", code, out.String())
+	}
+	if strings.Contains(out.String(), "GitHub would not re-run") {
+		t.Errorf("a timeout reported as a refusal:\n%s", out.String())
+	}
 }
