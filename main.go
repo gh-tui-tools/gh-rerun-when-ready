@@ -190,6 +190,12 @@ func transient(err error) bool {
 	return false
 }
 
+// requestTimeout bounds each API request. A connection can stall without the
+// OS ever reporting an error, so without a bound, a request on it would block
+// the watch for good. With one, it fails like any other unanswered request,
+// and gets retried.
+const requestTimeout = 30 * time.Second
+
 // The first wait before retrying a failed read. Each further wait doubles,
 // up to the polling interval.
 const firstRetryWait = 5 * time.Second
@@ -469,7 +475,7 @@ func main() {
 	}
 	o.repo, o.number = repo, number
 
-	rest, err := api.DefaultRESTClient()
+	rest, err := api.NewRESTClient(api.ClientOptions{Timeout: requestTimeout})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating API client: %v\n", err)
 		os.Exit(1)

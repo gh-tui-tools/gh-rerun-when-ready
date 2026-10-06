@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -328,6 +329,30 @@ func TestTransient(t *testing.T) {
 		if got := transient(tc.err); got != tc.want {
 			t.Errorf("transient(%v) = %v, want %v", tc.err, got, tc.want)
 		}
+	}
+}
+
+// stalledTransport never answers: It holds every request until the client
+// gives up on it.
+type stalledTransport struct{}
+
+func (stalledTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	<-req.Context().Done()
+	return nil, req.Context().Err()
+}
+
+func TestATimedOutRequestIsTransient(t *testing.T) {
+	// A request on a connection that stalls must come back as an error the
+	// watch retries, rather than block it.
+	rest, err := api.NewRESTClient(api.ClientOptions{Host: "github.com",
+		AuthToken: "token", Transport: stalledTransport{},
+		Timeout: 10 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, err = restClient{api: rest}.pullRequest("o/r", 1)
+	if err == nil || !transient(err) {
+		t.Fatalf("pullRequest() = %v, want a transient error", err)
 	}
 }
 
