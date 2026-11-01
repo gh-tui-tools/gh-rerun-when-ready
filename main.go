@@ -200,6 +200,34 @@ const requestTimeout = 30 * time.Second
 // up to the polling interval.
 const firstRetryWait = 5 * time.Second
 
+// The longest wait for a rate limit: GitHub resets its primary rate limit
+// every hour.
+const maxRateLimitWait = time.Hour + time.Minute
+
+// rateLimitWait reports how long a read that GitHub refused for its rate limit
+// has to wait before it can succeed, from what the refusal says: Retry-After
+// for a secondary limit, or X-RateLimit-Reset once the primary limit is spent.
+func rateLimitWait(err error, now time.Time) (time.Duration, bool) {
+	var httpErr *api.HTTPError
+	if !errors.As(err, &httpErr) {
+		return 0, false
+	}
+	if httpErr.StatusCode != http.StatusForbidden && httpErr.StatusCode != http.StatusTooManyRequests {
+		return 0, false
+	}
+	if seconds, err := strconv.Atoi(httpErr.Headers.Get("Retry-After")); err == nil {
+		return min(time.Duration(seconds)*time.Second, maxRateLimitWait), true
+	}
+	if httpErr.Headers.Get("X-RateLimit-Remaining") != "0" {
+		return 0, false
+	}
+	reset, err := strconv.ParseInt(httpErr.Headers.Get("X-RateLimit-Reset"), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return min(max(time.Unix(reset, 0).Sub(now)+time.Second, 0), maxRateLimitWait), true
+}
+
 // errInterrupted reports that an interrupt ended a wait between retries.
 var errInterrupted = errors.New("interrupted")
 
@@ -237,6 +265,17 @@ func (c retryingReads) retry(what string, read func() error) error {
 		err := read()
 		if err == nil || !transient(err) {
 			return err
+		}
+		// A rate limit says when it resets, and the read can't succeed before
+		// then, however long that is. So the wait doesn't count toward giving up.
+		if limitWait, limited := rateLimitWait(err, time.Now()); limited {
+			logf(c.out, "error %s: the API rate limit is spent, so waiting %s for it to reset",
+				what, limitWait.Round(time.Second))
+			if !sleep(limitWait, c.interrupt) {
+				return errInterrupted
+			}
+			since, wait = time.Time{}, min(firstRetryWait, c.o.interval)
+			continue
 		}
 		if since.IsZero() {
 			since = time.Now()

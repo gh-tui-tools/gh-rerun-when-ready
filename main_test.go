@@ -380,6 +380,59 @@ func TestWatchRetriesAReadThatTimesOut(t *testing.T) {
 	}
 }
 
+func TestWatchWaitsOutARateLimit(t *testing.T) {
+	// A spent rate limit can take up to an hour to reset, so the watch waits
+	// for it however long that takes, rather than giving up after retryFor.
+	limited := &api.HTTPError{StatusCode: 403, Headers: map[string][]string{
+		"Retry-After": {"0"}}}
+	green := rerun.Run{DatabaseID: 7, WorkflowName: "CI",
+		Status: "completed", Conclusion: "success"}
+	f := &fakeClient{sha: "abc", polls: [][]rerun.Run{{green}},
+		prErr: func(n int) error {
+			if n <= 5 {
+				time.Sleep(20 * time.Millisecond) // five of these outlast retryFor
+				return limited
+			}
+			return nil
+		}}
+
+	var out bytes.Buffer
+	code := watch(f, fast(options{repo: "o/r", number: 1}), &out, nil)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0\n%s", code, out.String())
+	}
+	if got := strings.Count(out.String(), "the API rate limit is spent"); got != 5 {
+		t.Errorf("reported %d rate-limit waits, want 5:\n%s", got, out.String())
+	}
+}
+
+func TestRateLimitWait(t *testing.T) {
+	now := time.Unix(1000, 0)
+	for _, tc := range []struct {
+		headers map[string][]string
+		status  int
+		want    time.Duration
+		limited bool
+	}{
+		{map[string][]string{"Retry-After": {"30"}}, 403, 30 * time.Second, true},
+		{map[string][]string{"Retry-After": {"30"}}, 429, 30 * time.Second, true},
+		{map[string][]string{"X-Ratelimit-Remaining": {"0"}, "X-Ratelimit-Reset": {"1600"}}, 403, 601 * time.Second, true},
+		{map[string][]string{"X-Ratelimit-Remaining": {"0"}, "X-Ratelimit-Reset": {"999999"}}, 403, maxRateLimitWait, true},
+		{map[string][]string{"X-Ratelimit-Remaining": {"0"}, "X-Ratelimit-Reset": {"900"}}, 403, 0, true},
+		{map[string][]string{"X-Ratelimit-Remaining": {"12"}}, 403, 0, false},
+		{map[string][]string{"Retry-After": {"30"}}, 404, 0, false},
+	} {
+		got, limited := rateLimitWait(&api.HTTPError{StatusCode: tc.status, Headers: tc.headers}, now)
+		if got != tc.want || limited != tc.limited {
+			t.Errorf("rateLimitWait(%d, %v) = %v, %v; want %v, %v", tc.status, tc.headers, got, limited, tc.want, tc.limited)
+		}
+	}
+	if _, limited := rateLimitWait(errTimeout, now); limited {
+		t.Error("an unanswered request isn't rate limited")
+	}
+}
+
 func TestWatchGivesUpOnReadsThatKeepFailing(t *testing.T) {
 	f := &fakeClient{sha: "abc", polls: [][]rerun.Run{{}},
 		prErr: func(n int) error {
