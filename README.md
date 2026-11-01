@@ -41,6 +41,8 @@ A request that gets no answer within 30 seconds (or whose connection drops), or 
 
 A spent API rate limit is different: GitHub says when it resets, so the watch waits until then, however long that is — up to an hour — rather than giving up.
 
+Each poll is a conditional request: It sends back the ETag of the last answer, and GitHub answers 304 Not Modified when nothing has changed. That answer doesn’t count against the API rate limit, which every watch on the account shares.
+
 Exit status is 0 when every run for the head commit has succeeded, and 1 when runs are still failing after the allotted attempts — or when GitHub declined to re-run one. Those two endings are reported separately — so a spent attempt budget never reads as a refusal.
 
 ## Develop

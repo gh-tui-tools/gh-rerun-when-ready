@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -9,9 +10,11 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cli/go-gh/v2/pkg/api"
+	"github.com/cli/go-gh/v2/pkg/auth"
 	"github.com/cli/go-gh/v2/pkg/repository"
 	"github.com/gh-tui-tools/gh-rerun-when-ready/internal/rerun"
 )
@@ -138,7 +141,81 @@ type client interface {
 	rerunFailedJobs(repo string, runID int64) error
 }
 
-type restClient struct{ api *api.RESTClient }
+// restClient reads with conditional requests: Each read sends back the ETag of
+// the last answer for its path, and GitHub answers 304 Not Modified when nothing
+// has changed since. That answer doesn't count against the rate limit, which
+// every watch on the account shares, and most polls change nothing.
+type restClient struct {
+	api   *api.RESTClient
+	http  *http.Client
+	base  string
+	cache map[string]cachedAnswer
+}
+
+type cachedAnswer struct {
+	etag string
+	body []byte
+}
+
+func newRESTClient(opts api.ClientOptions) (restClient, error) {
+	rest, err := api.NewRESTClient(opts)
+	if err != nil {
+		return restClient{}, err
+	}
+	httpClient, err := api.NewHTTPClient(opts)
+	if err != nil {
+		return restClient{}, err
+	}
+	host := opts.Host
+	if host == "" {
+		host, _ = auth.DefaultHost()
+	}
+	return restClient{api: rest, http: httpClient, base: restBase(host),
+		cache: map[string]cachedAnswer{}}, nil
+}
+
+// restBase is the root of the REST API on host.
+func restBase(host string) string {
+	switch {
+	case host == "github.com":
+		return "https://api.github.com/"
+	case strings.HasSuffix(host, ".ghe.com"):
+		return "https://api." + host + "/"
+	}
+	return "https://" + host + "/api/v3/"
+}
+
+func (c restClient) get(path string, v any) error {
+	request, err := http.NewRequest(http.MethodGet, c.base+path, nil)
+	if err != nil {
+		return err
+	}
+	cached, isCached := c.cache[path]
+	if isCached {
+		request.Header.Set("If-None-Match", cached.etag)
+	}
+	response, err := c.http.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+
+	var body []byte
+	switch {
+	case response.StatusCode == http.StatusNotModified && isCached:
+		body = cached.body
+	case response.StatusCode >= 200 && response.StatusCode < 300:
+		if body, err = io.ReadAll(response.Body); err != nil {
+			return err
+		}
+		if etag := response.Header.Get("ETag"); etag != "" {
+			c.cache[path] = cachedAnswer{etag: etag, body: body}
+		}
+	default:
+		return api.HandleHTTPError(response)
+	}
+	return json.Unmarshal(body, v)
+}
 
 func (c restClient) pullRequest(repo string, number int) (string, string, string, error) {
 	var pr struct {
@@ -147,7 +224,7 @@ func (c restClient) pullRequest(repo string, number int) (string, string, string
 		Title string               `json:"title"`
 	}
 	path := fmt.Sprintf("repos/%s/pulls/%d", repo, number)
-	if err := c.api.Get(path, &pr); err != nil {
+	if err := c.get(path, &pr); err != nil {
 		return "", "", "", err
 	}
 	return pr.Head.SHA, pr.State, pr.Title, nil
@@ -159,7 +236,7 @@ func (c restClient) runsForCommit(repo, sha string) ([]rerun.Run, error) {
 	}
 	path := fmt.Sprintf("repos/%s/actions/runs?head_sha=%s&per_page=100",
 		repo, url.QueryEscape(sha))
-	if err := c.api.Get(path, &body); err != nil {
+	if err := c.get(path, &body); err != nil {
 		return nil, err
 	}
 	return body.WorkflowRuns, nil
@@ -514,7 +591,7 @@ func main() {
 	}
 	o.repo, o.number = repo, number
 
-	rest, err := api.NewRESTClient(api.ClientOptions{Timeout: requestTimeout})
+	rest, err := newRESTClient(api.ClientOptions{Timeout: requestTimeout})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating API client: %v\n", err)
 		os.Exit(1)
@@ -522,5 +599,5 @@ func main() {
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt)
-	os.Exit(watch(restClient{api: rest}, o, os.Stdout, sig))
+	os.Exit(watch(rest, o, os.Stdout, sig))
 }

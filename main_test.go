@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -344,13 +346,13 @@ func (stalledTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 func TestATimedOutRequestIsTransient(t *testing.T) {
 	// A request on a connection that stalls must come back as an error the
 	// watch retries, rather than block it.
-	rest, err := api.NewRESTClient(api.ClientOptions{Host: "github.com",
+	rest, err := newRESTClient(api.ClientOptions{Host: "github.com",
 		AuthToken: "token", Transport: stalledTransport{},
 		Timeout: 10 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, _, err = restClient{api: rest}.pullRequest("o/r", 1)
+	_, _, _, err = rest.pullRequest("o/r", 1)
 	if err == nil || !transient(err) {
 		t.Fatalf("pullRequest() = %v, want a transient error", err)
 	}
@@ -537,5 +539,64 @@ func TestWatchGivesUpOnAReRunThatKeepsTimingOut(t *testing.T) {
 	}
 	if strings.Contains(out.String(), "GitHub would not re-run") {
 		t.Errorf("a timeout reported as a refusal:\n%s", out.String())
+	}
+}
+
+func TestReadsAreConditional(t *testing.T) {
+	// A read that GitHub answers 304 Not Modified doesn't count against the
+	// rate limit, so the second read of an unchanged pull request must send the
+	// first answer's ETag, and take its body from that answer.
+	var conditional, notModified int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("If-None-Match") != "" {
+			conditional++
+		}
+		if r.Header.Get("If-None-Match") == `W/"v1"` {
+			notModified++
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", `W/"v1"`)
+		fmt.Fprint(w, `{"head": {"sha": "abc"}, "state": "open", "title": "A title"}`)
+	}))
+	defer server.Close()
+
+	rest, err := newRESTClient(api.ClientOptions{Host: "github.com", AuthToken: "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rest.base, rest.http = server.URL+"/", server.Client()
+
+	for i := range 2 {
+		sha, state, title, err := rest.pullRequest("o/r", 1)
+		if err != nil || sha != "abc" || state != "open" || title != "A title" {
+			t.Fatalf("read %d: pullRequest() = %q, %q, %q, %v", i+1, sha, state, title, err)
+		}
+	}
+	if conditional != 1 || notModified != 1 {
+		t.Errorf("sent %d conditional reads (%d answered 304), want 1 (1)", conditional, notModified)
+	}
+}
+
+func TestAFailedReadIsAnHTTPError(t *testing.T) {
+	// A refusal has to come back as an *api.HTTPError, with its headers, so that
+	// transient() and rateLimitWait() can tell what kind it is.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-RateLimit-Remaining", "0")
+		w.Header().Set("X-RateLimit-Reset", "1")
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprint(w, `{"message": "API rate limit exceeded"}`)
+	}))
+	defer server.Close()
+
+	rest, err := newRESTClient(api.ClientOptions{Host: "github.com", AuthToken: "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rest.base, rest.http = server.URL+"/", server.Client()
+
+	_, err = rest.runsForCommit("o/r", "abc")
+	if _, limited := rateLimitWait(err, time.Now()); !limited || !transient(err) {
+		t.Errorf("runsForCommit() = %v, want a transient rate-limit error", err)
 	}
 }
