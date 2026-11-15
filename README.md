@@ -24,7 +24,7 @@ gh rerun-when-ready 123 --repo OWNER/REPO
 gh rerun-when-ready 123                  # from inside a clone of the repo
 ```
 
-It polls the PR and watches each workflow run separately, re-running the failed jobs of any run that failed, timed out, or was cancelled — as soon as that particular run finishes. It doesn’t wait on other runs.
+It polls the PR and watches each workflow run separately, re-running the failed jobs of any run that failed, timed out, or was cancelled — as soon as that particular run finishes. It doesn’t wait on other runs. A cancelled run that a newer run of the same workflow replaced is left alone, since re-running it would cancel its replacement in a workflow whose concurrency group allows one run at a time.
 
 | Option | Meaning |
 | --- | --- |

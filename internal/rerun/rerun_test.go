@@ -84,6 +84,29 @@ func TestClassify(t *testing.T) {
 		}
 	})
 
+	t.Run("a cancelled run that a newer run of its workflow replaced is left alone", func(t *testing.T) {
+		replaced := run(1, "completed", "cancelled")
+		replacement := run(2, "queued", "")
+		other := Run{DatabaseID: 3, WorkflowName: "Other", Status: "completed", Conclusion: "cancelled"}
+		b := Classify([]Run{replaced, replacement, other}, map[int64]int{}, 1)
+		// Re-running the replaced run would cancel its replacement in turn. A
+		// newer run of another workflow replaces nothing, and the newest run of
+		// a workflow is re-run as before.
+		if len(b.Rerun) != 1 || b.Rerun[0].DatabaseID != 3 {
+			t.Fatalf("want only run 3 rerunnable, got %+v", b.Rerun)
+		}
+		if len(b.Pending) != 1 || len(b.Exhausted) != 0 || len(b.Attention) != 0 {
+			t.Fatalf("want the replacement pending and nothing else, got %+v", b)
+		}
+	})
+
+	t.Run("a failed run is re-run even when a newer run of its workflow exists", func(t *testing.T) {
+		b := Classify([]Run{run(1, "completed", "failure"), run(2, "completed", "success")}, map[int64]int{}, 1)
+		if len(b.Rerun) != 1 || b.Rerun[0].DatabaseID != 1 {
+			t.Fatalf("want run 1 rerunnable, got %+v", b.Rerun)
+		}
+	})
+
 	t.Run("settled conclusions are left alone", func(t *testing.T) {
 		runs := []Run{
 			run(1, "completed", "success"),

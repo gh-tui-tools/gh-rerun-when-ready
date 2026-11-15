@@ -42,7 +42,8 @@ run's other jobs are still going. That refusal applies to one run at a time.
 So, each workflow run of the head commit is watched separately: Its failed
 jobs are re-run as soon as that run itself finishes, whether or not the
 commit's other runs have. Runs that failed, timed out, or were cancelled are
-the ones re-run.
+the ones re-run, except a cancelled run that a newer run of the same workflow
+replaced.
 
 Arguments:
   <pull-request>          Pull request number or URL

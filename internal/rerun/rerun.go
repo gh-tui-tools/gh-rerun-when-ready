@@ -73,12 +73,31 @@ type Buckets struct {
 	Attention []Run
 }
 
+// IsSuperseded reports whether a cancelled run has a newer run of the same
+// workflow among runs. A workflow whose concurrency group cancels a run when
+// a newer one starts (one benchmark run per pull request, e.g.) leaves the
+// cancelled run with nothing to do; and re-running it would cancel the newer
+// run in turn.
+func IsSuperseded(r Run, runs []Run) bool {
+	if r.Conclusion != "cancelled" {
+		return false
+	}
+	for _, other := range runs {
+		if other.WorkflowName == r.WorkflowName && other.DatabaseID > r.DatabaseID {
+			return true
+		}
+	}
+	return false
+}
+
 // Classify sorts runs into buckets. attempts records how many times each run
 // has already been re-run, and maxAttempts caps that.
 func Classify(runs []Run, attempts map[int64]int, maxAttempts int) Buckets {
 	var b Buckets
 	for _, r := range runs {
 		switch {
+		case IsSuperseded(r, runs):
+			// Settled: A newer run of the same workflow replaced it.
 		case IsPending(r):
 			b.Pending = append(b.Pending, r)
 		case IsRerunnable(r):
